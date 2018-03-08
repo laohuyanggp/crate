@@ -27,7 +27,10 @@ import io.crate.action.sql.ResultReceiver;
 import io.crate.data.Row;
 import io.crate.exceptions.SQLExceptions;
 import org.apache.logging.log4j.Logger;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateObserver;
 import org.elasticsearch.common.logging.Loggers;
+import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.transport.ConnectTransportException;
 
@@ -41,16 +44,19 @@ public class RetryOnFailureResultReceiver implements ResultReceiver {
 
     private static final Logger LOGGER = Loggers.getLogger(RetryOnFailureResultReceiver.class);
 
+    private final ClusterStateObserver clusterStateObserver;
     private final Predicate<String> hasIndex;
     private final ResultReceiver delegate;
     private final UUID jobId;
     private final BiConsumer<UUID, ResultReceiver> retryAction;
     private int attempt = 1;
 
-    public RetryOnFailureResultReceiver(Predicate<String> hasIndex,
+    public RetryOnFailureResultReceiver(ClusterStateObserver clusterStateObserver,
+                                        Predicate<String> hasIndex,
                                         ResultReceiver delegate,
                                         UUID jobId,
                                         BiConsumer<UUID, ResultReceiver> retryAction) {
+        this.clusterStateObserver = clusterStateObserver;
         this.hasIndex = hasIndex;
         this.delegate = delegate;
         this.jobId = jobId;
@@ -73,14 +79,28 @@ public class RetryOnFailureResultReceiver implements ResultReceiver {
     }
 
     @Override
-    public void fail(@Nonnull Throwable t) {
-        t = SQLExceptions.unwrap(t);
+    public void fail(@Nonnull Throwable wrappedError) {
+        final Throwable error = SQLExceptions.unwrap(wrappedError);
         if (attempt <= Constants.MAX_SHARD_MISSING_RETRIES &&
-            (SQLExceptions.isShardFailure(t) || t instanceof ConnectTransportException || indexWasTemporaryUnavailable(t))) {
-            attempt += 1;
-            retry();
+            (SQLExceptions.isShardFailure(error) || error instanceof ConnectTransportException || indexWasTemporaryUnavailable(error))) {
+            clusterStateObserver.waitForNextChange(new ClusterStateObserver.Listener() {
+                @Override
+                public void onNewClusterState(ClusterState state) {
+                    attempt += 1;
+                    retry();
+                }
+
+                @Override
+                public void onClusterServiceClose() {
+                }
+
+                @Override
+                public void onTimeout(TimeValue timeout) {
+                    delegate.fail(error);
+                }
+            });
         } else {
-            delegate.fail(t);
+            delegate.fail(error);
         }
     }
 

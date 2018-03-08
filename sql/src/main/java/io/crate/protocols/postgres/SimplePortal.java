@@ -46,6 +46,8 @@ import io.crate.planner.PlannerContext;
 import io.crate.sql.tree.Statement;
 import io.crate.types.DataType;
 import org.apache.logging.log4j.Logger;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateObserver;
 import org.elasticsearch.common.Randomness;
 import org.elasticsearch.common.logging.Loggers;
 
@@ -172,8 +174,9 @@ public class SimplePortal extends AbstractPortal {
         assert analyzedStatement != null : "analyzedStatement must not be null";
         UUID jobId = UUID.randomUUID();
         RoutingProvider routingProvider = new RoutingProvider(Randomness.get().nextInt(), planner.getAwarenessAttributes());
+        ClusterState clusterState = planner.currentClusterState();
         PlannerContext plannerContext = new PlannerContext(
-            planner.currentClusterState(),
+            clusterState,
             routingProvider,
             jobId,
             planner.functions(),
@@ -189,11 +192,13 @@ public class SimplePortal extends AbstractPortal {
             throw t;
         }
 
+        DependencyCarrier dependencyCarrier = portalContext.getExecutor();
         if (!analyzedStatement.isWriteOperation()) {
             resultReceiver = new RetryOnFailureResultReceiver(
+                new ClusterStateObserver(clusterState, dependencyCarrier.clusterService(), null, LOGGER, dependencyCarrier.threadPool().getThreadContext()),
                 // not using planner.currentClusterState().metaData()::hasIndex to make sure the *current*
                 // clusterState at the time of the index check is used
-                indexName -> planner.currentClusterState().metaData().hasIndex(indexName),
+                indexName -> clusterState.metaData().hasIndex(indexName),
                 resultReceiver,
                 jobId,
                 (newJobId, resultReceiver) -> retryQuery(planner, newJobId)
@@ -207,7 +212,7 @@ public class SimplePortal extends AbstractPortal {
         if (!resumeIfSuspended()) {
             consumer = new RowConsumerToResultReceiver(resultReceiver, maxRows);
             plan.execute(
-                portalContext.getExecutor(),
+                dependencyCarrier,
                 plannerContext,
                 consumer,
                 rowParams,
